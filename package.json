@@ -1,0 +1,23 @@
+{
+  "name": "opencode-zen-harness",
+  "version": "1.0.0",
+  "description": "Dynamic multi-agent harness for autonomous software engineering, routed across OpenCode Zen models.",
+  "type": "module",
+  "private": true,
+  "engines": {
+    "node": ">=22.6.0"
+  },
+  "bin": {
+    "zen-harness": "./src/index.ts"
+  },
+  "scripts": {
+    "start": "node src/index.ts",
+    "demo": "node src/index.ts --demo",
+    "selftest": "node src/selftest.ts",
+    "typecheck": "tsc --noEmit"
+  },
+  "devDependencies": {
+    "@types/node": "^22.10.0",
+    "typescript": "^5.7.0"
+  }
+}

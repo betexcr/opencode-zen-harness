@@ -50,7 +50,7 @@ export interface HarnessState {
   readonly updatedAt: string;
 }
 
-function deepFreeze<T>(value: T, seen: WeakSet<object> = new WeakSet()): T {
+export function deepFreeze<T>(value: T, seen: WeakSet<object> = new WeakSet()): T {
   if (value === null || typeof value !== "object") return value;
   const obj = value as unknown as object;
   if (seen.has(obj) || Object.isFrozen(obj)) return value;
@@ -121,11 +121,22 @@ export interface TransactOptions {
   readonly note?: string;
 }
 
+export interface StateStoreOptions {
+  /**
+   * Invoked with the new frozen snapshot after every transition. Used to drive
+   * durable checkpointing; must not throw (errors are swallowed so a failed
+   * save never breaks a run).
+   */
+  readonly onTransition?: (state: HarnessState) => void;
+}
+
 export class StateStore {
   #state: HarnessState;
+  #onTransition: ((state: HarnessState) => void) | undefined;
 
-  constructor(initial: HarnessState) {
+  constructor(initial: HarnessState, options: StateStoreOptions = {}) {
     this.#state = deepFreeze(initial);
+    this.#onTransition = options.onTransition;
   }
 
   /** Immutable snapshot of the current state. */
@@ -161,6 +172,13 @@ export class StateStore {
       updatedAt: ts,
     };
     this.#state = deepFreeze(next);
+    if (this.#onTransition) {
+      try {
+        this.#onTransition(this.#state);
+      } catch {
+        /* a failed checkpoint must never break the run */
+      }
+    }
     return this.#state;
   }
 

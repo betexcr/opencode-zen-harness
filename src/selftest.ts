@@ -17,6 +17,16 @@ import { SandboxViolation } from "./core/errors.ts";
 import { MockLLMClient } from "./llm/client.ts";
 import { ModelCallError, RetryExhaustedError, isFatalModelError, isRetryableError, withRetry } from "./core/errors.ts";
 import { parseEvents } from "./llm/opencodeCliClient.ts";
+import {
+  CHECKPOINT_VERSION,
+  Checkpointer,
+  CheckpointError,
+  checkpointPath,
+  parseCheckpoint,
+  readCheckpoint,
+  serializeCheckpoint,
+  writeCheckpoint,
+} from "./core/checkpoint.ts";
 import { SystemToolbox } from "./tools/toolbox.ts";
 import { Orchestrator } from "./orchestration/orchestrator.ts";
 import { AGENT_MODEL_ROUTING } from "./config/models.ts";
@@ -53,6 +63,27 @@ async function makeTempDir(prefix: string): Promise<string> {
 async function rmrf(dir: string): Promise<void> {
   await fs.rm(dir, { recursive: true, force: true });
 }
+
+function blankProfile(mode: "new" | "existing" = "new"): ProjectProfile {
+  return {
+    mode,
+    language: "unknown",
+    packageManager: null,
+    signatureFiles: [],
+    commands: { install: null, build: null, test: null, lint: null, format: null, run: null },
+    isGitRepo: false,
+    notes: [],
+  };
+}
+
+const NO_GIT = {
+  isRepo: false,
+  branch: null,
+  dirtyBefore: false,
+  scratchBranch: null,
+  createdScratch: false,
+  baseCommit: null,
+} as const;
 
 // ---------------------------------------------------------------------------
 // Cases
@@ -499,6 +530,156 @@ async function opencodeCliCases(): Promise<void> {
   });
 }
 
+async function checkpointCases(): Promise<void> {
+  await test("checkpoint: serialize -> parse round-trips a frozen state", async () => {
+    const root = await makeTempDir("ckpt");
+    try {
+      const store = new StateStore(
+        createInitialState({ goal: "roundtrip", workspaceRoot: root, profile: blankProfile(), git: NO_GIT }),
+      );
+      const parsed = parseCheckpoint(serializeCheckpoint(store.get()));
+      assert(parsed.version === CHECKPOINT_VERSION, "version not preserved");
+      assert(parsed.state.goal === "roundtrip", "goal not preserved");
+      assert(Object.isFrozen(parsed.state), "parsed state should be frozen");
+    } finally {
+      await rmrf(root);
+    }
+  });
+
+  await test("checkpoint: write -> read persists to run.json", async () => {
+    const root = await makeTempDir("ckpt");
+    try {
+      const store = new StateStore(
+        createInitialState({ goal: "persist", workspaceRoot: root, profile: blankProfile(), git: NO_GIT }),
+      );
+      const file = await writeCheckpoint(root, store.get());
+      assert(file === checkpointPath(root), "unexpected checkpoint path");
+      const read = await readCheckpoint(root);
+      assert(read !== null, "checkpoint should exist after write");
+      assert(read?.state.goal === "persist", "goal not persisted");
+    } finally {
+      await rmrf(root);
+    }
+  });
+
+  await test("checkpoint: read returns null when no checkpoint exists", async () => {
+    const root = await makeTempDir("ckpt");
+    try {
+      assert((await readCheckpoint(root)) === null, "expected null for a missing checkpoint");
+    } finally {
+      await rmrf(root);
+    }
+  });
+
+  await test("checkpoint: an unsupported version is rejected", () => {
+    let threw = false;
+    try {
+      parseCheckpoint(JSON.stringify({ version: 999, state: {} }));
+    } catch (error) {
+      threw = error instanceof CheckpointError;
+    }
+    assert(threw, "expected CheckpointError for an unsupported version");
+  });
+
+  await test("checkpoint: Checkpointer.mark + flush persists the latest state", async () => {
+    const root = await makeTempDir("ckpt");
+    try {
+      const checkpointer = new Checkpointer({ root, delayMs: 5 });
+      const store = new StateStore(
+        createInitialState({ goal: "autosave", workspaceRoot: root, profile: blankProfile(), git: NO_GIT }),
+        { onTransition: (state) => checkpointer.mark(state) },
+      );
+      store.setPhase("planning", "planning:start", "decomposing goal");
+      await checkpointer.flush();
+      const read = await readCheckpoint(root);
+      assert(read?.state.phase === "planning", `phase not checkpointed: ${read?.state.phase}`);
+    } finally {
+      await rmrf(root);
+    }
+  });
+}
+
+async function resumeCase(verbose: boolean): Promise<void> {
+  const root = await makeTempDir("resume");
+  try {
+    await test("resume: skips completed tasks and re-runs only the rest", async () => {
+      const toolbox = await SystemToolbox.create({ root });
+
+      const seed = new StateStore(
+        createInitialState({ goal: "Resume demo", workspaceRoot: root, profile: blankProfile(), git: NO_GIT }),
+      );
+      seed.setPlan({
+        summary: "two tasks",
+        tasks: [
+          {
+            id: "task-1",
+            title: "already done",
+            description: "no-op",
+            files: [],
+            commands: [],
+            acceptance: [],
+            dependsOn: [],
+            status: "done",
+            attempts: 1,
+            lastError: null,
+          },
+          {
+            id: "task-2",
+            title: "remaining work",
+            description: "create src/hello.ts and a test",
+            files: ["src/hello.ts"],
+            commands: [],
+            acceptance: [],
+            dependsOn: ["task-1"],
+            status: "pending",
+            attempts: 0,
+            lastError: null,
+          },
+        ],
+      });
+      await writeCheckpoint(root, seed.get());
+
+      const loaded = await readCheckpoint(root);
+      assert(loaded !== null, "seed checkpoint missing");
+      const store = new StateStore(loaded!.state);
+
+      const client = new MockLLMClient([
+        JSON.stringify({ thought: "write", tool: "write_file", args: { path: "src/hello.ts", content: "export const hello = (): string => 'hi';\n" } }),
+        JSON.stringify({ thought: "builder done", final: { files: [{ path: "src/hello.ts", summary: "hello" }], notes: "" } }),
+        JSON.stringify({ thought: "write test", tool: "write_file", args: { path: "tests/hello.test.ts", content: "console.log('ok');\n" } }),
+        JSON.stringify({ thought: "tests done", final: { testFiles: [{ path: "tests/hello.test.ts", summary: "smoke" }], commands: ['node -e "process.exit(0)"'], notes: "" } }),
+        JSON.stringify({ thought: "review", final: { approved: true, summary: "ok", findings: [] } }),
+        JSON.stringify({ thought: "audit", final: { safe: true, summary: "ok", findings: [] } }),
+      ]);
+
+      const orchestrator = new Orchestrator({
+        goal: store.get().goal,
+        store,
+        client,
+        toolbox,
+        routing: { ...AGENT_MODEL_ROUTING },
+        maxSteps: 8,
+        maxRetries: 2,
+        maxDebugAttempts: 2,
+        maxBuildCycles: 2,
+        contextBudgetBytes: 32 * 1024,
+        verbose,
+      });
+      await orchestrator.run();
+
+      const state = store.get();
+      assert(state.status === "succeeded", `run should succeed, got ${state.status}`);
+      assert(state.tasks[0]!.status === "done", "task-1 should remain done");
+      assert(state.tasks[0]!.attempts === 1, "task-1 must not be re-attempted on resume");
+      assert(state.tasks[1]!.status === "done", `task-2 should be done, got ${state.tasks[1]!.status}`);
+      assert(state.plan?.summary === "two tasks", "existing plan must be reused, not regenerated");
+      assert(state.metrics.agentCalls === 6, `expected 6 agent calls (task-2 only, no planner), got ${state.metrics.agentCalls}`);
+    });
+  } finally {
+    await rmrf(root);
+  }
+}
+
 export async function runSelfTest(options: { verbose?: boolean } = {}): Promise<number> {
   const verbose = options.verbose ?? false;
   const started = Date.now();
@@ -511,7 +692,9 @@ export async function runSelfTest(options: { verbose?: boolean } = {}): Promise<
   await gitSafetyCases();
   await retryCases();
   await opencodeCliCases();
+  await checkpointCases();
   await orchestrationCase(verbose);
+  await resumeCase(verbose);
 
   let passed = 0;
   for (const result of results) {

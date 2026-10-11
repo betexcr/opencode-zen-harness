@@ -134,6 +134,7 @@ Role names for overrides: `ORCHESTRATOR`, `PLANNER`, `REPO_EXPLORER`, `BUILDER`,
 ```
 node src/index.ts --goal "<goal>" [--workspace <dir>] [--verbose]
 node src/index.ts --goal-file <path> [--workspace <dir>]
+node src/index.ts --resume [--workspace <dir>] [--verbose]
 node src/index.ts --ping
 node src/index.ts --demo
 ```
@@ -146,9 +147,26 @@ node src/index.ts --demo
 | `-v`, `--verbose` | Stream agent and boundary logs. |
 | `--max-steps <n>` | Max ReAct steps per agent. |
 | `--max-retries <n>` | Retries per agent boundary. |
+| `--resume` | Resume the last run from `.harness-scratch/run.json` (skips completed tasks, re-runs the rest). |
 | `--ping` | Preflight each routed model; reports auth/route status. |
 | `--demo` | Run the offline self-test suite and exit. |
 | `-h`, `--help` | Show help. |
+
+### Crash resilience (`--resume`)
+
+Every state transition is checkpointed to `.harness-scratch/run.json` (atomic
+temp-file + rename, debounced). If a run is interrupted, re-run it with
+`--resume` to pick up where it left off:
+
+```
+node src/index.ts --resume --workspace ./my-project
+```
+
+On resume the harness reuses the persisted plan, profile, git safety lock, and
+`runId`; it skips tasks already marked `done`, re-queues any task left
+`in-progress`, and does not re-invoke the planner. Pass `--goal` only if it
+matches the checkpointed goal (otherwise the run is rejected). The checkpoint is
+cleared automatically when a fresh (non-`--resume`) run starts.
 
 ---
 
@@ -172,6 +190,7 @@ src/
   config/models.ts            Model registry, role routing, generation params
   core/
     state.ts                  Immutable HarnessState + StateStore
+    checkpoint.ts             Crash-resilient checkpoint (serialize/atomic write + autosave)
     types.ts                  Shared domain types
     errors.ts                 Error taxonomy, retry classification, Result
     env.ts                    .env loader
@@ -202,7 +221,7 @@ npm run selftest     # node src/selftest.ts  (offline, deterministic)
 npm run demo         # alias for --demo
 ```
 
-The self-test runs entirely offline against a `MockLLMClient` and covers the sandbox, ignore matcher, diff engine, discovery, the git safety lock, retry classification, the CLI bridge parser, and a full multi-agent loop.
+The self-test runs entirely offline against a `MockLLMClient` and covers the sandbox, ignore matcher, diff engine, discovery, the git safety lock, retry classification, the CLI bridge parser, checkpoint round-trips, and both a full multi-agent loop and a `--resume` run.
 
 ---
 
@@ -211,3 +230,4 @@ The self-test runs entirely offline against a `MockLLMClient` and covers the san
 - With the `opencode-cli` transport each agent turn spawns a process, so full runs are slow; this is inherent to using the free tier.
 - The direct `zen` transport with the default `-free` models will fail with HTTP 403 unless routed via the OpenCode client — override the models or the base URL first.
 - Long agent transcripts over the CLI transport re-send the flattened conversation each turn; keep `HARNESS_MAX_AGENT_STEPS` modest for large repos.
+- State is checkpointed after every transition, but an in-flight `run_command` (up to ~600s) is not interruptible; a crash mid-command loses only that command's progress, and `--resume` re-runs the task.

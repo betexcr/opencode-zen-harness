@@ -11,7 +11,8 @@
 
 import { readFileSync } from "node:fs";
 import { loadDotEnv } from "./core/env.ts";
-import { StateStore, createInitialState } from "./core/state.ts";
+import { StateStore, createInitialState, type HarnessState } from "./core/state.ts";
+import { Checkpointer, checkpointPath, clearCheckpoint, readCheckpoint } from "./core/checkpoint.ts";
 import { ModelCallError } from "./core/errors.ts";
 import { createLLMClient, pingModel, resolveTransport } from "./llm/factory.ts";
 import { SystemToolbox } from "./tools/toolbox.ts";
@@ -27,6 +28,7 @@ interface CliOptions {
   verbose: boolean;
   demo: boolean;
   ping: boolean;
+  resume: boolean;
   maxSteps: number | null;
   maxRetries: number | null;
 }
@@ -39,6 +41,7 @@ function parseArgs(argv: readonly string[]): CliOptions {
     verbose: false,
     demo: false,
     ping: false,
+    resume: false,
     maxSteps: null,
     maxRetries: null,
   };
@@ -71,6 +74,9 @@ function parseArgs(argv: readonly string[]): CliOptions {
       case "--ping":
         opts.ping = true;
         break;
+      case "--resume":
+        opts.resume = true;
+        break;
       case "--max-steps":
         opts.maxSteps = Number(next());
         break;
@@ -97,6 +103,7 @@ function printHelp(): void {
       "Usage:",
       "  node src/index.ts --goal \"<goal>\" [--workspace <dir>] [--verbose]",
       "  node src/index.ts --goal-file <path> [--workspace <dir>]",
+      "  node src/index.ts --resume [--workspace <dir>] [--verbose]",
       "  node src/index.ts --demo",
       "",
       "Options:",
@@ -104,6 +111,8 @@ function printHelp(): void {
       "      --goal-file <path>  Read the goal from a file.",
       "  -w, --workspace <dir>   Target workspace root (default: cwd).",
       "  -v, --verbose           Stream agent + boundary logs to the console.",
+      "      --resume            Resume the last run from .harness-scratch/run.json",
+      "                          (skips completed tasks; re-runs the rest).",
       "      --max-steps <n>     Max ReAct steps per agent (default: 12).",
       "      --max-retries <n>   Retries per agent boundary (default: 4).",
       "      --ping              Preflight each routed model and report auth/route status.",
@@ -165,34 +174,67 @@ export async function main(argv: readonly string[] = process.argv.slice(2)): Pro
     return allOk ? 0 : 1;
   }
 
-  const goal = readGoal(opts);
-  if (!goal) {
-    printHelp();
-    return 2;
-  }
-
   const workspaceRoot = opts.workspace ?? process.env.HARNESS_WORKSPACE ?? process.cwd();
   const maxSteps = opts.maxSteps ?? Number(process.env.HARNESS_MAX_AGENT_STEPS ?? 12);
   const maxRetries = opts.maxRetries ?? Number(process.env.HARNESS_MAX_RETRIES ?? 4);
 
   const toolbox = await SystemToolbox.create({ root: workspaceRoot });
-  const bootstrapProfile: ProjectProfile = {
-    mode: "new",
-    language: "unknown",
-    packageManager: null,
-    signatureFiles: [],
-    commands: { install: null, build: null, test: null, lint: null, format: null, run: null },
-    isGitRepo: false,
-    notes: ["bootstrap placeholder until discovery runs"],
-  };
-  const store = new StateStore(
-    createInitialState({
-      goal,
-      workspaceRoot: toolbox.root,
-      profile: bootstrapProfile,
-      git: { isRepo: false, branch: null, dirtyBefore: false, scratchBranch: null, createdScratch: false, baseCommit: null },
-    }),
-  );
+  const checkpointer = new Checkpointer({
+    root: toolbox.root,
+    onError: (error) => console.error(`[checkpoint] ${error instanceof Error ? error.message : String(error)}`),
+  });
+  const onTransition = (state: HarnessState): void => checkpointer.mark(state);
+
+  let store: StateStore;
+  if (opts.resume) {
+    let checkpoint;
+    try {
+      checkpoint = await readCheckpoint(toolbox.root);
+    } catch (error) {
+      console.error(`error: ${error instanceof Error ? error.message : String(error)}`);
+      return 2;
+    }
+    if (!checkpoint) {
+      console.error(`error: no checkpoint found at ${checkpointPath(toolbox.root)}; nothing to resume`);
+      return 2;
+    }
+    const requested = readGoal(opts);
+    if (requested && requested !== checkpoint.state.goal) {
+      console.error("error: --goal differs from the checkpointed goal; omit it to resume the saved run");
+      return 2;
+    }
+    console.log(
+      `resuming run ${checkpoint.state.runId} from ${checkpointPath(toolbox.root)} (phase=${checkpoint.state.phase})`,
+    );
+    store = new StateStore(checkpoint.state, { onTransition });
+  } else {
+    const goal = readGoal(opts);
+    if (!goal) {
+      printHelp();
+      return 2;
+    }
+    await clearCheckpoint(toolbox.root);
+    const bootstrapProfile: ProjectProfile = {
+      mode: "new",
+      language: "unknown",
+      packageManager: null,
+      signatureFiles: [],
+      commands: { install: null, build: null, test: null, lint: null, format: null, run: null },
+      isGitRepo: false,
+      notes: ["bootstrap placeholder until discovery runs"],
+    };
+    store = new StateStore(
+      createInitialState({
+        goal,
+        workspaceRoot: toolbox.root,
+        profile: bootstrapProfile,
+        git: { isRepo: false, branch: null, dirtyBefore: false, scratchBranch: null, createdScratch: false, baseCommit: null },
+      }),
+      { onTransition },
+    );
+  }
+
+  const goal = store.get().goal;
 
   const orchestrator = new Orchestrator({
     goal,
@@ -209,6 +251,7 @@ export async function main(argv: readonly string[] = process.argv.slice(2)): Pro
   });
 
   await orchestrator.run();
+  await checkpointer.flush();
   return store.get().status === "succeeded" ? 0 : 1;
 }
 

@@ -83,33 +83,42 @@ export class Orchestrator {
 
   async run(): Promise<void> {
     const { store } = this.#cfg;
+    const resuming = store.get().plan !== null;
     store.setStatus("running");
-    this.log("info", "orchestrator", `run started: ${this.#cfg.goal}`);
 
-    // 1) Discovery + git safety lock.
-    store.setPhase("discovery", "discovery:start", "scanning workspace");
-    const discovered = await discover(this.#cfg.toolbox, store.get().runId);
-    store.setProfile(discovered.profile);
-    store.setGit(discovered.git);
-    this.log("info", "discovery", `mode=${discovered.profile.mode} language=${discovered.profile.language} git=${discovered.git.isRepo}`);
-    if (discovered.git.createdScratch) {
-      this.log("warn", "discovery", `dirty tree detected; cut scratch branch ${discovered.git.scratchBranch}`);
+    if (resuming) {
+      this.#normalizeResumed();
+      const s = store.get();
+      const done = s.tasks.filter((t) => t.status === "done").length;
+      this.log("info", "orchestrator", `resuming run ${s.runId} (phase=${s.phase}, ${done}/${s.tasks.length} task(s) done) - ${this.#cfg.goal}`);
+    } else {
+      this.log("info", "orchestrator", `run started: ${this.#cfg.goal}`);
+
+      // 1) Discovery + git safety lock.
+      store.setPhase("discovery", "discovery:start", "scanning workspace");
+      const discovered = await discover(this.#cfg.toolbox, store.get().runId);
+      store.setProfile(discovered.profile);
+      store.setGit(discovered.git);
+      this.log("info", "discovery", `mode=${discovered.profile.mode} language=${discovered.profile.language} git=${discovered.git.isRepo}`);
+      if (discovered.git.createdScratch) {
+        this.log("warn", "discovery", `dirty tree detected; cut scratch branch ${discovered.git.scratchBranch}`);
+      }
+
+      // 2) Planning.
+      store.setPhase("planning", "planning:start", "decomposing goal");
+      const plan = await this.#plan();
+      if (this.#fatal) return this.#abortFatal();
+      if (plan.tasks.length === 0) {
+        this.log("warn", "orchestrator", "planner returned no tasks; nothing to do");
+        store.setStatus("succeeded");
+        store.setPhase("done", "run:done", "no tasks");
+        return;
+      }
+      this.log("info", "planner", `plan: ${plan.tasks.length} task(s) - ${plan.summary}`);
     }
 
-    // 2) Planning.
-    store.setPhase("planning", "planning:start", "decomposing goal");
-    const plan = await this.#plan();
-    if (this.#fatal) return this.#abortFatal();
-    if (plan.tasks.length === 0) {
-      this.log("warn", "orchestrator", "planner returned no tasks; nothing to do");
-      store.setStatus("succeeded");
-      store.setPhase("done", "run:done", "no tasks");
-      return;
-    }
-    this.log("info", "planner", `plan: ${plan.tasks.length} task(s) - ${plan.summary}`);
-
-    // 3) Exploration (structural index) for existing projects.
-    if (discovered.profile.mode === "existing") {
+    // 3) Exploration (structural index) for existing projects, unless already indexed.
+    if (store.get().profile.mode === "existing" && store.get().index === null) {
       store.setPhase("exploring", "exploring:start", "indexing repository");
       await this.#explore();
       if (this.#fatal) return this.#abortFatal();
@@ -533,6 +542,15 @@ export class Orchestrator {
     store.setPhase("failed", "run:aborted", "fatal configuration/auth error");
     this.log("error", "orchestrator", `run aborted: ${errorMessage(this.#fatal)}`);
     this.#printSummary();
+  }
+
+  /** On resume, re-queue any task that was mid-flight when the run was interrupted. */
+  #normalizeResumed(): void {
+    for (const task of this.#store.get().tasks) {
+      if (task.status === "in-progress") {
+        this.#store.setTaskStatus(task.id, "pending", task.lastError);
+      }
+    }
   }
 
   #baseContext(): Omit<AgentContext, "role" | "model" | "generation"> & { routing: AgentRouting } {

@@ -130,18 +130,32 @@ export async function request<T>(path: string, options: RequestOptions = {}): Pr
     else signal.addEventListener("abort", onExternalAbort, { once: true });
   }
 
+  const fetchPromise = fetch(url, {
+    method,
+    headers: {
+      Accept: "application/json",
+      ...(body !== undefined ? { "Content-Type": "application/json" } : {}),
+    },
+    body: body !== undefined ? JSON.stringify(body) : undefined,
+    signal: controller.signal,
+    cache: "no-store",
+  });
+
+  const abortPromise = new Promise<never>((_resolve, abortReject) => {
+    controller.signal.addEventListener(
+      "abort",
+      () => {
+        const error = new Error("Aborted");
+        error.name = "AbortError";
+        abortReject(error);
+      },
+      { once: true },
+    );
+  });
+
   let response: Response;
   try {
-    response = await fetch(url, {
-      method,
-      headers: {
-        Accept: "application/json",
-        ...(body !== undefined ? { "Content-Type": "application/json" } : {}),
-      },
-      body: body !== undefined ? JSON.stringify(body) : undefined,
-      signal: controller.signal,
-      cache: "no-store",
-    });
+    response = await Promise.race([fetchPromise, abortPromise]);
   } catch (error) {
     if (timedOut) {
       throw new ApiError("timeout", `Request to ${url} timed out after ${timeoutMs}ms.`, {

@@ -7,6 +7,7 @@ import {
   type Cents,
 } from "./money";
 import { discountedPriceCents, discountAmountCents } from "./pricing";
+import { maxOrderableQuantity } from "./inventory";
 
 /**
  * Cart math for Meridian Commerce OS.
@@ -34,6 +35,17 @@ export interface CartLine {
   discountPercentage: number;
   /** Quantity in whole units. */
   quantity: number;
+  /**
+   * Minimum order quantity (MOQ) captured at add-to-cart time, when known.
+   * Optional: domain math ignores it, but the cart UI clamps quantity steppers
+   * so a bulk-only product is never ordered below its minimum.
+   */
+  minimumOrderQuantity?: number;
+  /**
+   * Available stock captured at add-to-cart time, when known. Optional: the
+   * cart UI clamps quantity steppers so a line never exceeds what is on hand.
+   */
+  stock?: number;
 }
 
 /** Coerce a quantity into a non-negative whole number; invalid input is 0. */
@@ -112,6 +124,45 @@ export function cartItemCount(lines: readonly CartLine[]): number {
 /** Number of distinct lines in the cart. */
 export function cartLineCount(lines: readonly CartLine[]): number {
   return lines.length;
+}
+
+/**
+ * Minimum purchasable quantity for a line: its MOQ, or 1 when unknown. The
+ * cart record carries the MOQ captured at add-to-cart time so a bulk-only
+ * product is never stepped below its minimum.
+ */
+export function minimumLineQuantity(line: CartLine): number {
+  const moq = line.minimumOrderQuantity;
+  return typeof moq === "number" && Number.isFinite(moq) && moq > 0
+    ? Math.floor(moq)
+    : 1;
+}
+
+/**
+ * Maximum purchasable quantity for a line: the largest MOQ multiple that fits
+ * within the captured stock, or `Infinity` when stock is unknown.
+ */
+export function maximumLineQuantity(line: CartLine): number {
+  const { stock } = line;
+  if (typeof stock !== "number" || !Number.isFinite(stock)) {
+    return Number.POSITIVE_INFINITY;
+  }
+  const max = maxOrderableQuantity({
+    stock,
+    minimumOrderQuantity: line.minimumOrderQuantity,
+  });
+  return Math.max(minimumLineQuantity(line), max);
+}
+
+/**
+ * Clamp an arbitrary quantity into a line's purchasable range. Non-finite or
+ * non-positive input resolves to the line minimum.
+ */
+export function clampLineQuantity(line: CartLine, quantity: number): number {
+  const minimum = minimumLineQuantity(line);
+  if (!Number.isFinite(quantity) || quantity <= 0) return minimum;
+  const maximum = maximumLineQuantity(line);
+  return Math.min(maximum, Math.max(minimum, Math.floor(quantity)));
 }
 
 /* -------------------------------------------------------------------------- */

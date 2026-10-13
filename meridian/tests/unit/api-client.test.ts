@@ -136,11 +136,7 @@ describe("api client", () => {
     vi.stubGlobal(
       "fetch",
       typedFetchMock(
-        () =>
-          new Promise<Response>((_resolve, reject) => {
-            _resolve;
-            reject;
-          }),
+        () => new Promise<Response>(() => undefined),
       ),
     );
 

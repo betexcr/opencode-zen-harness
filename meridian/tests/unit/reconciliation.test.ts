@@ -2,7 +2,6 @@ import { describe, expect, it } from "vitest";
 
 import type { Product } from "@/lib/api/schemas";
 import {
-  applyProductOverride,
   reconcileCatalog,
   type ProductOverride,
 } from "@/lib/domain/product";

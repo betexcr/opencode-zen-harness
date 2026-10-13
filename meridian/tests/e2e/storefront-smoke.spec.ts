@@ -4,22 +4,19 @@ import { expect, test, type Page } from "@playwright/test";
  * Storefront happy-path smoke.
  *
  * Walks the primary shopper journey against the running app: open the
- * catalogue, apply a search, open a product detail, add the product to the
- * cart, and confirm the cart shows the added line and a total. Selectors are
- * limited to stable, semantic landmarks (roles, accessible names, headings) so
- * the spec survives styling changes, matching the style of
+ * catalogue, apply a search, open a product detail by clicking its card, add
+ * the product to the cart, and confirm the cart shows the added line and a
+ * total. Selectors are limited to stable, semantic landmarks (roles, accessible
+ * names, headings) so the spec survives styling changes, matching the style of
  * `tests/e2e/home.spec.ts`.
  *
  * The catalogue and product data are produced by the live sample API, so the
  * spec asserts structure rather than exact money strings: the product's own
  * title (read from the detail heading) is asserted as a cart line, and the
- * order summary is asserted to expose a currency total. Product id 1 is
- * pre-rendered by `generateStaticParams`, so the detail route resolves without
- * a cold fetch.
+ * order summary is asserted to expose a currency total. The first catalogue
+ * card resolves to a detail route covered by `generateStaticParams`, so the
+ * click navigates without relying on a cold fetch.
  */
-
-/** A product id covered by the catalogue's `generateStaticParams` pre-render. */
-const PRODUCT_ID = 1;
 
 /**
  * Assert the product detail page is ready and return its title. The heading is
@@ -56,7 +53,13 @@ test.describe("storefront smoke", () => {
 
     await expect(page).toHaveURL(/[?&]q=phone/);
 
-    await page.goto(`/products/${PRODUCT_ID}`);
+    // The primary journey starts from the listing: a card click must reach the
+    // matching product detail route rather than a static dead tile.
+    await page.goto("/products");
+    const firstCard = page.getByRole("main").getByRole("link").first();
+    await expect(firstCard).toBeVisible();
+    await firstCard.click();
+    await expect(page).toHaveURL(/\/products\/\d+/);
     const title = await expectProductTitle(page);
 
     await page.getByRole("button", { name: "Add to cart" }).click();
